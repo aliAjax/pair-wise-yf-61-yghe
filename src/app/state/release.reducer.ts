@@ -1,6 +1,7 @@
 import { createReducer, on } from '@ngrx/store';
 import type { AuditEntry, DeviceGroup, ReleaseBatch, ReleaseState } from './release.models';
 import { approveBatch, createBatch, pauseBatch, resumeBatch, rollbackBatch, telemetryTick } from './release.actions';
+import { buildGateways, migrateState, recheckBeforeResume, simulateTick, STORAGE_KEY, WAVE_COUNT } from './release.logic';
 
 const initialGroups: DeviceGroup[] = [
   { id: 'g-edge', name: '华东边缘网关', region: '华东', count: 680, compatible: true, offlineGateways: 4 },
@@ -8,14 +9,42 @@ const initialGroups: DeviceGroup[] = [
   { id: 'g-clinic', name: '远程诊疗终端', region: '新加坡', count: 310, compatible: true, offlineGateways: 2 }
 ];
 const now = new Date().toISOString();
-const initialBatches: ReleaseBatch[] = [
-  { id: 'batch-demo', name: '边缘网关安全补丁 2.8.1', firmware: '2.8.1', rollbackVersion: '2.7.9', groupId: 'g-edge', rolloutPercent: 20, failureThreshold: 5, status: 'approved', progress: 0, downloaded: 0, failed: 0, updatedAt: now }
-];
+const demoBatchBase: ReleaseBatch = {
+  id: 'batch-demo',
+  name: '边缘网关安全补丁 2.8.1',
+  firmware: '2.8.1',
+  rollbackVersion: '2.7.9',
+  groupId: 'g-edge',
+  rolloutPercent: 20,
+  failureThreshold: 5,
+  status: 'approved',
+  progress: 0,
+  downloaded: 0,
+  failed: 0,
+  pendingVerification: 0,
+  pendingOffline: 0,
+  failureRate: 0,
+  waveCount: WAVE_COUNT,
+  activeWave: -1,
+  pausedReason: null,
+  gateways: [],
+  updatedAt: now
+};
+const initialBatches: ReleaseBatch[] = [{ ...demoBatchBase, gateways: buildGateways(demoBatchBase, initialGroups[0]) }];
 const initialAudits: AuditEntry[] = [{ id: 'audit-1', at: now, actor: '运维值班', message: '批次 batch-demo 完成兼容性检查并进入已审批' }];
-const STORAGE_KEY = 'firmware-release-v1';
-const fallback: ReleaseState = { groups: initialGroups, batches: initialBatches, audits: initialAudits };
-const stored = typeof localStorage === 'undefined' ? fallback : JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null') as ReleaseState | null;
-const initialState = stored ?? fallback;
+const fallback: ReleaseState = { version: 2, groups: initialGroups, batches: initialBatches, audits: initialAudits };
+
+function loadState(): ReleaseState {
+  if (typeof localStorage === 'undefined') return fallback;
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null') as unknown;
+    return migrateState(raw, fallback);
+  } catch {
+    return fallback;
+  }
+}
+
+const initialState = loadState();
 
 function audit(state: ReleaseState, actor: string, message: string): AuditEntry[] {
   return [{ id: crypto.randomUUID(), at: new Date().toISOString(), actor, message }, ...state.audits];
@@ -23,24 +52,62 @@ function audit(state: ReleaseState, actor: string, message: string): AuditEntry[
 
 export const releaseReducer = createReducer(
   initialState,
-  on(createBatch, (state, { batch }) => ({ ...state, batches: [batch, ...state.batches], audits: audit(state, '发布负责人', `创建批次 ${batch.name}`) })),
-  on(approveBatch, (state, { id, actor }) => ({ ...state, batches: state.batches.map((batch) => batch.id === id ? { ...batch, status: 'approved', updatedAt: new Date().toISOString() } : batch), audits: audit(state, actor, `批次 ${id} 审批通过`) })),
-  on(pauseBatch, (state, { id, actor }) => ({ ...state, batches: state.batches.map((batch) => batch.id === id ? { ...batch, status: 'paused', updatedAt: new Date().toISOString() } : batch), audits: audit(state, actor, `批次 ${id} 已暂停`) })),
-  on(resumeBatch, (state, { id, actor }) => ({ ...state, batches: state.batches.map((batch) => batch.id === id ? { ...batch, status: 'running', updatedAt: new Date().toISOString() } : batch), audits: audit(state, actor, `批次 ${id} 恢复发布`) })),
-  on(rollbackBatch, (state, { id, actor }) => ({ ...state, batches: state.batches.map((batch) => batch.id === id ? { ...batch, status: 'rolled_back', updatedAt: new Date().toISOString() } : batch), audits: audit(state, actor, `批次 ${id} 已紧急回滚`) })),
-  on(telemetryTick, (state) => {
-    const batches = state.batches.map((batch) => {
-      if (batch.status !== 'running') return batch;
+  on(createBatch, (state, { batch }) => {
+    const group = state.groups.find((item) => item.id === batch.groupId);
+    const withGateways: ReleaseBatch = {
+      ...batch,
+      waveCount: WAVE_COUNT,
+      activeWave: -1,
+      pausedReason: null,
+      gateways: buildGateways(batch, group)
+    };
+    return { ...state, batches: [withGateways, ...state.batches], audits: audit(state, '发布负责人', `创建批次 ${batch.name}`) };
+  }),
+  on(approveBatch, (state, { id, actor }) => ({
+    ...state,
+    batches: state.batches.map((batch) => (batch.id === id ? { ...batch, status: 'approved', updatedAt: new Date().toISOString() } : batch)),
+    audits: audit(state, actor, `批次 ${id} 审批通过`)
+  })),
+  on(pauseBatch, (state, { id, actor }) => ({
+    ...state,
+    batches: state.batches.map((batch) =>
+      batch.id === id ? { ...batch, status: 'paused', pausedReason: batch.pausedReason ?? '手动暂停', updatedAt: new Date().toISOString() } : batch
+    ),
+    audits: audit(state, actor, `批次 ${id} 已暂停`)
+  })),
+  on(resumeBatch, (state, { id, actor }) => {
+    const events: string[] = [];
+    const batches = state.batches.map((batch): ReleaseBatch => {
+      if (batch.id !== id) return batch;
       const group = state.groups.find((item) => item.id === batch.groupId);
-      const target = Math.round((group?.count ?? 0) * batch.rolloutPercent / 100);
-      const increment = Math.max(4, Math.round(target * 0.055));
-      const downloaded = Math.min(target, batch.downloaded + increment);
-      const failed = batch.failed + (Math.random() < 0.08 ? 1 : 0);
-      const failureRate = downloaded ? failed / downloaded * 100 : 0;
-      const status: ReleaseBatch['status'] = failureRate > batch.failureThreshold ? 'paused' : downloaded >= target ? 'completed' : 'running';
-      return { ...batch, downloaded, failed, progress: target ? Math.round(downloaded / target * 100) : 0, status, updatedAt: new Date().toISOString() };
+      if (batch.status === 'approved') {
+        events.push(`批次 ${batch.id} 开始发布`);
+        return { ...batch, status: 'running', updatedAt: new Date().toISOString() };
+      }
+      if (batch.status === 'paused') {
+        const result = recheckBeforeResume(batch, group);
+        if (result.event) events.push(result.event);
+        return result.batch;
+      }
+      return batch;
     });
-    const overflow = batches.some((batch, index) => batch.status === 'paused' && state.batches[index]?.status === 'running');
-    return { ...state, batches, audits: overflow ? audit(state, '系统', '失败率超过阈值，已自动暂停发布') : state.audits };
+    const newAudits = events.map((message) => ({ id: crypto.randomUUID(), at: new Date().toISOString(), actor, message }));
+    return { ...state, batches, audits: [...newAudits, ...state.audits] };
+  }),
+  on(rollbackBatch, (state, { id, actor }) => ({
+    ...state,
+    batches: state.batches.map((batch) => (batch.id === id ? { ...batch, status: 'rolled_back', pausedReason: null, updatedAt: new Date().toISOString() } : batch)),
+    audits: audit(state, actor, `批次 ${id} 已紧急回滚`)
+  })),
+  on(telemetryTick, (state) => {
+    const events: string[] = [];
+    const batches = state.batches.map((batch) => {
+      const group = state.groups.find((item) => item.id === batch.groupId);
+      const result = simulateTick(batch, group);
+      events.push(...result.events);
+      return result.batch;
+    });
+    const newAudits = events.map((message) => ({ id: crypto.randomUUID(), at: new Date().toISOString(), actor: '系统', message }));
+    return { ...state, batches, audits: [...newAudits, ...state.audits] };
   })
 );
